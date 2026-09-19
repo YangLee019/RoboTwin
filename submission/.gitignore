@@ -1,0 +1,10 @@
+# 模型权重只进提交包，不进 Git
+03_模型权重/checkpoint/*
+!03_模型权重/checkpoint/.gitkeep
+
+# 打包中间产物
+_staging/
+*.zip
+
+# 真机 Demo 视频通常很大，按需纳入
+05_真机创新可选任务/*.mp4
