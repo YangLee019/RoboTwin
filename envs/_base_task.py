@@ -1,6 +1,10 @@
 import os
 import re
 import sapien.core as sapien
+sapien.set_log_level("warning")
+sapien.render.set_ray_tracing_denoiser("none")
+sapien.render.set_log_level("critical")
+
 from sapien.render import clear_cache as sapien_clear_cache
 from sapien.utils.viewer import Viewer
 import numpy as np
@@ -214,7 +218,6 @@ class Base_Task(gym.Env):
         sapien.render.set_camera_shader_dir("rt")
         sapien.render.set_ray_tracing_samples_per_pixel(32)
         sapien.render.set_ray_tracing_path_depth(8)
-        sapien.render.set_ray_tracing_denoiser("oidn")
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()

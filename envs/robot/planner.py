@@ -271,9 +271,42 @@ try:
             return result_p, result_q
     
 except Exception as e:
-    print('[planner.py]: Something wrong happened when importing CuroboPlanner! Please check if Curobo is installed correctly. If the problem still exists, you can install Curobo from https://github.com/NVlabs/curobo manually.')
-    print('Exception traceback:')
-    traceback.print_exc()
+    _CUROBO_IMPORT_ERROR = e
+    if __import__('os').environ.get('ROBOTWIN_DISABLE_CUROBO') != '1':
+        print('[planner.py]: Something wrong happened when importing CuroboPlanner! Please check if Curobo is installed correctly. If the problem still exists, you can install Curobo from https://github.com/NVlabs/curobo manually.')
+        print('Exception traceback:')
+        traceback.print_exc()
+
+    class CuroboPlanner:
+        """Allow policy-only rollouts to initialize without Curobo kernels.
+
+        A learned policy drives the joints directly and does not use this
+        planner. Expert generation still fails loudly unless the opt-in
+        environment variable is set.
+        """
+
+        def __init__(self, *args, **kwargs):
+            import os
+
+            if os.environ.get("ROBOTWIN_DISABLE_CUROBO") != "1":
+                raise RuntimeError(
+                    "Curobo is unavailable. Set ROBOTWIN_DISABLE_CUROBO=1 only "
+                    "for policy rollouts with expert_check=false."
+                ) from _CUROBO_IMPORT_ERROR
+
+        def plan_grippers(self, now_val, target_val):
+            values = np.linspace(now_val, target_val, 200)
+            return {
+                "num_step": 200,
+                "per_step": (target_val - now_val) / 200,
+                "result": values,
+            }
+
+        def __getattr__(self, name):
+            raise RuntimeError(
+                f"Curobo planner operation {name!r} is unavailable in a "
+                "policy-only rollout."
+            )
 
 
 # ********************** MplibPlanner **********************
@@ -421,6 +454,39 @@ class MplibPlanner:
             result = self.plan_screw(now_qpos, target_pose, use_point_cloud, use_attach, arms_tag, log)
 
         return result
+
+    def plan_batch(
+        self,
+        curr_joint_pos,
+        target_gripper_pose_list,
+        constraint_pose=None,
+        arms_tag=None,
+    ):
+        """MPLib compatibility implementation of Curobo's batch planner.
+
+        MPLib has no equivalent batch API, so evaluate each candidate pose
+        independently and preserve the result layout used by
+        ``Base_Task.choose_best_pose``.
+        """
+        statuses = []
+        positions = []
+        velocities = []
+        for target_pose in target_gripper_pose_list:
+            result = self.plan_path(
+                curr_joint_pos,
+                target_pose,
+                arms_tag=arms_tag,
+                log=False,
+            )
+            statuses.append(result.get("status", "Fail"))
+            positions.append(result.get("position", []))
+            velocities.append(result.get("velocity", []))
+
+        return {
+            "status": np.asarray(statuses, dtype=object),
+            "position": positions,
+            "velocity": velocities,
+        }
 
     def plan_grippers(self, now_val, target_val):
         num_step = 200  # TODO

@@ -301,13 +301,23 @@ class Robot:
             self.right_proc.start()
 
         if self.need_topp:
+            ee_planner = os.environ.get("ROBOTWIN_EE_PLANNER", "")
+            mplib_type = "mplib_screw" if ee_planner == "mplib_screw" else "mplib_RRT"
+            left_mplib_type = (
+                mplib_type if ee_planner.startswith("mplib")
+                else self.left_planner_type
+            )
+            right_mplib_type = (
+                mplib_type if ee_planner.startswith("mplib")
+                else self.right_planner_type
+            )
             self.left_mplib_planner = MplibPlanner(
                 self.left_urdf_path,
                 self.left_srdf_path,
                 self.left_move_group,
                 self.left_entity_origion_pose,
                 self.left_entity,
-                self.left_planner_type,
+                left_mplib_type,
                 scene,
             )
             self.right_mplib_planner = MplibPlanner(
@@ -316,7 +326,7 @@ class Robot:
                 self.right_move_group,
                 self.right_entity_origion_pose,
                 self.right_entity,
-                self.right_planner_type,
+                right_mplib_type,
                 scene,
             )
 
@@ -370,6 +380,13 @@ class Robot:
         for i in range(len(target_lst_copy)):
             target_lst_copy[i] = self._trans_from_gripper_to_endlink(target_lst_copy[i], arm_tag="left")
 
+        if os.environ.get("ROBOTWIN_EE_PLANNER", "").startswith("mplib"):
+            if not hasattr(self, "left_mplib_planner"):
+                raise RuntimeError("MPLib EE fallback requested but left MPLib planner is unavailable")
+            return self.left_mplib_planner.plan_batch(
+                now_qpos, target_lst_copy, constraint_pose=constraint_pose, arms_tag="left"
+            )
+
         if self.communication_flag:
             self.left_conn.send({
                 "cmd": "plan_batch",
@@ -405,6 +422,13 @@ class Robot:
         for i in range(len(target_lst_copy)):
             target_lst_copy[i] = self._trans_from_gripper_to_endlink(target_lst_copy[i], arm_tag="right")
 
+        if os.environ.get("ROBOTWIN_EE_PLANNER", "").startswith("mplib"):
+            if not hasattr(self, "right_mplib_planner"):
+                raise RuntimeError("MPLib EE fallback requested but right MPLib planner is unavailable")
+            return self.right_mplib_planner.plan_batch(
+                now_qpos, target_lst_copy, constraint_pose=constraint_pose, arms_tag="right"
+            )
+
         if self.communication_flag:
             self.right_conn.send({
                 "cmd": "plan_batch",
@@ -439,6 +463,13 @@ class Robot:
 
         trans_target_pose = self._trans_from_gripper_to_endlink(target_pose, arm_tag="left")
 
+        if os.environ.get("ROBOTWIN_EE_PLANNER", "").startswith("mplib"):
+            if not hasattr(self, "left_mplib_planner"):
+                raise RuntimeError("MPLib EE fallback requested but left MPLib planner is unavailable")
+            return self.left_mplib_planner.plan_path(
+                now_qpos, trans_target_pose, arms_tag="left"
+            )
+
         if self.communication_flag:
             self.left_conn.send({
                 "cmd": "plan_path",
@@ -472,6 +503,13 @@ class Robot:
             now_qpos = deepcopy(last_qpos)
 
         trans_target_pose = self._trans_from_gripper_to_endlink(target_pose, arm_tag="right")
+
+        if os.environ.get("ROBOTWIN_EE_PLANNER", "").startswith("mplib"):
+            if not hasattr(self, "right_mplib_planner"):
+                raise RuntimeError("MPLib EE fallback requested but right MPLib planner is unavailable")
+            return self.right_mplib_planner.plan_path(
+                now_qpos, trans_target_pose, arms_tag="right"
+            )
 
         if self.communication_flag:
             self.right_conn.send({

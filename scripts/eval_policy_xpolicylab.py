@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import ast
 import copy
+import json
 import importlib
 import multiprocessing as mp
 import os
 import queue
 import subprocess
 import sys
+import time
 import traceback
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -84,6 +86,18 @@ def build_policy_client(usr_args: dict[str, Any]):
 
     host = usr_args.get("host") or usr_args.get("policy_server_host") or "localhost"
     port = usr_args.get("port") or usr_args.get("policy_server_port")
+
+    if protocol == "lingbot_vla_v2":
+        if port is None:
+            raise ValueError("port must be set for lingbot_vla_v2")
+        source_root = usr_args.get("lingbot_vla_source") or os.environ.get("LINGBOT_VLA_SOURCE")
+        if source_root and source_root not in sys.path:
+            sys.path.insert(0, source_root)
+        from deploy.websocket_client_policy import WebsocketClientPolicy
+
+        client = WebsocketClientPolicy(host=host, port=int(port))
+        client._robotwin_protocol = protocol
+        return client
 
     if protocol == "ws":
         from client_server.ws import WsModelClient
@@ -174,6 +188,10 @@ def load_task_args(usr_args: dict[str, Any]) -> tuple[dict[str, Any], str]:
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
     args["policy_name"] = usr_args["policy_name"]
+    if usr_args.get("instruction_override"):
+        args["instruction_override"] = usr_args["instruction_override"]
+    if "eval_video_log" in usr_args:
+        args["eval_video_log"] = parse_bool(usr_args["eval_video_log"])
     ensure_xpolicylab_observation_flags(args)
 
     embodiment_type = args.get("embodiment")
@@ -302,7 +320,7 @@ def main(usr_args: dict[str, Any]) -> None:
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
 
     seed = int(usr_args["seed"])
-    st_seed = 100000 * (1 + seed)
+    st_seed = int(usr_args.get("seed_start", 100000 * (1 + seed)))
     test_num = int(usr_args.get("test_num", 100))
 
     model_client = build_policy_client(usr_args)
@@ -362,7 +380,7 @@ def main_batch(usr_args: dict[str, Any]) -> None:
         print_config(args, embodiment_name)
 
     seed = int(usr_args["seed"])
-    st_seed = 100000 * (1 + seed)
+    st_seed = int(usr_args.get("seed_start", 100000 * (1 + seed)))
     test_num = int(usr_args.get("test_num") or 100)
     requested_workers = int(usr_args.get("num_workers") or 1)
     worker_num = max(1, min(requested_workers, test_num))
@@ -685,6 +703,7 @@ def run_one_batch_episode(
         task_env._set_eval_video_ffmpeg(ffmpeg)
 
     succ = False
+    inference_latencies = []
     prepare_policy_case(model_client, task_name, seed_value, instruction, action_type)
     reset_policy(model_client)
     try:
@@ -698,7 +717,9 @@ def run_one_batch_episode(
                 task_env=task_env,
             )
             model_client.call(func_name="update_obs", obs=xpl_obs)
+            infer_start = time.perf_counter()
             action_chunk = normalize_action_chunk(model_client.call(func_name="get_action"))
+            inference_latencies.append(time.perf_counter() - infer_start)
             if len(action_chunk) == 0:
                 raise RuntimeError("Policy returned an empty action chunk.")
 
@@ -737,6 +758,14 @@ def run_one_batch_episode(
 
     notify_trial_end(model_client, task_name, seed_value, succ)
 
+    if inference_latencies:
+        values = np.asarray(inference_latencies, dtype=np.float64)
+        print(
+            f"[benchmark_timing] worker={worker_id} seed={seed_value} calls={len(values)} "
+            f"mean_s={values.mean():.4f} p50_s={np.percentile(values, 50):.4f} "
+            f"p95_s={np.percentile(values, 95):.4f} total_s={values.sum():.4f}"
+        )
+
     task_env.close_env()
     if task_env.render_freq:
         task_env.viewer.close()
@@ -747,6 +776,8 @@ def run_one_batch_episode(
         "worker_id": worker_id,
         "seed": seed_value,
         "success": bool(succ),
+        "inference_calls": len(inference_latencies),
+        "inference_total_s": float(sum(inference_latencies)),
     }
 
 
@@ -766,6 +797,9 @@ def eval_remote_policy(
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
     expert_check = parse_bool(usr_args.get("expert_check", True))
+    accept_expert_info = parse_bool(
+        usr_args.get("accept_expert_info_on_failure", True)
+    )
     frequency = int(usr_args.get("frequency", usr_args.get("ctrl_freq", 30)))
     action_type = str(usr_args.get("action_type", "joint"))
 
@@ -784,23 +818,58 @@ def eval_remote_policy(
         episode_info = {"info": {}}
 
         if expert_check:
+            expert_plan_success = False
+            expert_task_success = False
+            expert_error = None
             try:
                 task_env.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = task_env.play_once()
+                expert_plan_success = bool(task_env.plan_success)
+                expert_task_success = bool(task_env.check_success())
+                output_path = usr_args.get("episode_info_output")
+                if output_path:
+                    output_path = Path(output_path)
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    record = {
+                        "task_name": task_name,
+                        "task_config": args["task_config"],
+                        "seed": now_seed,
+                        "plan_success": expert_plan_success,
+                        "task_success": expert_task_success,
+                        "info": episode_info.get("info", {}),
+                        "episode_info": episode_info,
+                    }
+                    with output_path.open("a", encoding="utf-8") as output_file:
+                        output_file.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
                 task_env.close_env()
-            except UnStableError:
+            except UnStableError as exc:
+                expert_error = {"type": type(exc).__name__, "message": str(exc)}
+                try:
+                    episode_info = {"info": {}, "render_observation": task_env.get_obs()}
+                except Exception:
+                    episode_info = {"info": {}}
                 task_env.close_env()
-                now_seed += 1
-                args["render_freq"] = render_freq
-                continue
+                if not accept_expert_info:
+                    now_seed += 1
+                    continue
             except Exception as e:
+                expert_error = {"type": type(e).__name__, "message": str(e)}
+                try:
+                    episode_info = {"info": {}, "render_observation": task_env.get_obs()}
+                except Exception:
+                    episode_info = {"info": {}}
                 task_env.close_env()
-                now_seed += 1
-                args["render_freq"] = render_freq
-                print(f"error occurs during expert check! seed={now_seed - 1} err={type(e).__name__}: {e}")
-                continue
+                if not accept_expert_info:
+                    now_seed += 1
+                    args["render_freq"] = render_freq
+                    print(f"error occurs during expert check! seed={now_seed - 1} err={type(e).__name__}: {e}")
+                    continue
 
-        if (not expert_check) or (task_env.plan_success and task_env.check_success()):
+        if (
+            (not expert_check)
+            or accept_expert_info
+            or (expert_plan_success and expert_task_success)
+        ):
             succ_seed += 1
         else:
             now_seed += 1
@@ -808,7 +877,14 @@ def eval_remote_policy(
             continue
 
         args["render_freq"] = render_freq
-        task_env.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+        try:
+            task_env.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+        except UnStableError:
+            task_env.close_env()
+            if not expert_check:
+                succ_seed -= 1
+            now_seed += 1
+            continue
 
         instruction = build_instruction(args, episode_info, instruction_type, test_num)
         task_env.set_instruction(instruction=instruction)
@@ -843,11 +919,38 @@ def eval_remote_policy(
             task_env._set_eval_video_ffmpeg(ffmpeg)
 
         succ = False
-        prepare_policy_case(model_client, task_name, now_seed, instruction, action_type)
-        reset_policy(model_client)
+        inference_latencies = []
+        direct_lingbot = getattr(model_client, "_robotwin_protocol", "") == "lingbot_vla_v2"
+        if direct_lingbot:
+            model_client.infer({"reset": True, "robo_name": usr_args.get("robo_name", "robotwin")})
+        else:
+            prepare_policy_case(model_client, task_name, now_seed, instruction, action_type)
+            reset_policy(model_client)
         try:
             while not is_episode_end(task_env):
                 observation = task_env.get_obs()
+                if direct_lingbot:
+                    request = {
+                        "observation.images.cam_high": observation["observation"]["head_camera"]["rgb"],
+                        "observation.images.cam_left_wrist": observation["observation"]["left_camera"]["rgb"],
+                        "observation.images.cam_right_wrist": observation["observation"]["right_camera"]["rgb"],
+                        "observation.state": observation["joint_action"]["vector"],
+                        "task": task_env.get_instruction(),
+                    }
+                    infer_start = time.perf_counter()
+                    response = model_client.infer(request)
+                    inference_latencies.append(time.perf_counter() - infer_start)
+                    action_chunk = normalize_action_chunk(response["action"])
+                    for action in action_chunk:
+                        task_env.take_action(np.asarray(action, dtype=np.float32))
+                        if task_env.eval_success:
+                            succ = True
+                            break
+                        if is_episode_end(task_env):
+                            break
+                    if succ:
+                        break
+                    continue
                 xpl_obs = robotwin_obs_to_xpolicylab(
                     observation,
                     instruction=task_env.get_instruction(),
@@ -856,7 +959,9 @@ def eval_remote_policy(
                     task_env=task_env,
                 )
                 model_client.call(func_name="update_obs", obs=xpl_obs)
+                infer_start = time.perf_counter()
                 action_chunk = normalize_action_chunk(model_client.call(func_name="get_action"))
+                inference_latencies.append(time.perf_counter() - infer_start)
                 if len(action_chunk) == 0:
                     raise RuntimeError("Policy returned an empty action chunk.")
 
@@ -893,7 +998,16 @@ def eval_remote_policy(
         if task_env.eval_video_path is not None:
             task_env._del_eval_video_ffmpeg()
 
-        notify_trial_end(model_client, task_name, now_seed, succ)
+        if not direct_lingbot:
+            notify_trial_end(model_client, task_name, now_seed, succ)
+
+        if inference_latencies:
+            values = np.asarray(inference_latencies, dtype=np.float64)
+            print(
+                f"[benchmark_timing] seed={now_seed} calls={len(values)} "
+                f"mean_s={values.mean():.4f} p50_s={np.percentile(values, 50):.4f} "
+                f"p95_s={np.percentile(values, 95):.4f} total_s={values.sum():.4f}"
+            )
 
         if succ:
             task_env.suc += 1
@@ -921,19 +1035,37 @@ def eval_remote_policy(
 
 
 def build_instruction(args: dict[str, Any], episode_info: dict[str, Any], instruction_type: str | None, test_num: int) -> str:
+    instruction_override = args.get("instruction_override")
+    if instruction_override:
+        return str(instruction_override)
     if not instruction_type:
         return args["task_name"]
 
-    try:
-        episode_info_list = [episode_info.get("info", {})]
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        candidates = results[0].get(instruction_type)
-        if candidates:
-            return np.random.choice(candidates)
-    except Exception:
-        print("Failed to generate episode instruction; using task name as instruction.")
+    episode_parameters = episode_info.get("info", {})
+    if episode_parameters:
+        try:
+            results = generate_episode_descriptions(
+                args["task_name"], [episode_parameters], test_num
+            )
+            candidates = results[0].get(instruction_type)
+            if candidates:
+                return np.random.choice(candidates)
+        except Exception as exc:
+            print(f"Failed to render episode instruction: {type(exc).__name__}: {exc}")
 
-    return args["task_name"]
+    instruction_file = (
+        ROBOTWIN_ROOT / "description" / "task_instruction" / f"{args['task_name']}.json"
+    )
+    try:
+        full_description = yaml.safe_load(instruction_file.read_text(encoding="utf-8")).get(
+            "full_description"
+        )
+        if full_description:
+            return str(full_description)
+    except (OSError, AttributeError, yaml.YAMLError) as exc:
+        print(f"Failed to load task description: {type(exc).__name__}: {exc}")
+
+    return args["task_name"].replace("_", " ")
 
 
 def reset_policy(model_client) -> None:
@@ -1280,16 +1412,19 @@ def parse_args() -> dict[str, Any]:
     parser.add_argument("--policy_name", required=True)
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", required=True)
-    parser.add_argument("--protocol", default="ws", choices=("ws", "legacy_tcp"))
+    parser.add_argument("--protocol", default="ws", choices=("ws", "legacy_tcp", "lingbot_vla_v2"))
     parser.add_argument("--eval_batch", default="false")
     parser.add_argument("--root_dir", default=str(ROBOTWIN_ROOT))
     parser.add_argument("--device_id", default="0")
     parser.add_argument("--additional_info", default="")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed_start", type=int, default=None)
     parser.add_argument("--task_config", default="demo_clean")
     parser.add_argument("--test_num", type=int, default=None)
     parser.add_argument("--instruction_type", choices=("seen", "unseen"))
     parser.add_argument("--expert_check", default=None)
+    parser.add_argument("--accept_expert_info_on_failure", default=None)
+    parser.add_argument("--episode_info_output", default=None)
     parser.add_argument("--frequency", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--max_seed_attempts", type=int, default=None)
@@ -1311,11 +1446,17 @@ def parse_args() -> dict[str, Any]:
         "xpolicylab_root": str(Path(args.root_dir).resolve() / "XPolicyLab"),
         "eval_batch": parse_bool(args.eval_batch),
     }
+    if args.seed_start is not None:
+        usr_args["seed_start"] = args.seed_start
 
     if args.test_num is not None:
         usr_args["test_num"] = args.test_num
     if args.expert_check is not None:
         usr_args["expert_check"] = parse_bool(args.expert_check)
+    if args.accept_expert_info_on_failure is not None:
+        usr_args["accept_expert_info_on_failure"] = parse_bool(args.accept_expert_info_on_failure)
+    if args.episode_info_output is not None:
+        usr_args["episode_info_output"] = args.episode_info_output
     if args.frequency is not None:
         usr_args["frequency"] = args.frequency
     if args.num_workers is not None:
