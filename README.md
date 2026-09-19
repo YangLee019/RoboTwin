@@ -301,6 +301,8 @@ This repository is released under the MIT license. See [LICENSE](./LICENSE) for 
 
 目标：基于 **LingBot-VLA 2.0**，完成 RoboTwin Aloha-AgileX 的 50 个任务训练、仿真评测和材料提交。
 
+详细的论文解读、赛制约束和实验优先级见 [RoboTwin 2.0 论文解读与比赛改进计划](docs/ROBOTWIN_2_0_PAPER_AND_COMPETITION_PLAN.md)。
+
 ## 当前状态
 
 | 阶段 | 状态 | 下一步完成条件 |
