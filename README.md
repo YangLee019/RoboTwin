@@ -296,3 +296,24 @@ Contact [Tianxing Chen](https://tianxingchen.github.io) if you have any question
 
 # 🏷️ License
 This repository is released under the MIT license. See [LICENSE](./LICENSE) for additional details.
+
+# To Do
+离初赛提交还差这些关键工作：
+阶段	   当前状态	    还需完成
+AMD环境	 基础         GPU、BF16、RCCL 已通过	运行阶段二 v3，确认 LingBot Flex 与 fused MoE 通过
+RoboTwin 安装	       未在云端完成	初始化 XPolicyLab、安装 RoboTwin 仿真环境和资产
+LingBot  适配	       未验证	现有 XPolicyLab 的 LingBot_VLA 适配器基于 Qwen2.5-VL-3B；比赛要求 LingBot-VLA 2.0 预训练模型，需要核对并适配 6B 权重与 checkpoint 格式
+数据	   未下载/转换	 下载全部 50 个任务的 clean 轨迹，每任务 50 条；转换为 LingBot 所需 LeRobot 数据；生成归一化统计
+训练	   未开始	     单任务 loss/checkpoint 冒烟 → 单卡参数调优 → 全部 50 clean 任务训练
+仿真评测	 未开始	     50 任务 × clean/randomized × 100 次，共 10,000 次，填入官方 results.json
+提交材料	 未生成	     代码、训练/评测脚本、配置、checkpoint、复现与调优报告、正式结果 JSON 打包
+
+RoboTwin 当前的 all_tasks.yml 已列出 50 个任务，但默认配置是 gpu_ids: "0-7"，需要改成适合你这台单卡 AMD 云实例的执行方式。评测配置
+RoboTwin 的评测入口是 scripts/eval_policy.sh，通过 XPolicyLab 启动策略服务和仿真任务。评测脚本
+最大风险是 LingBot 适配器版本不一致：当前子模块中的适配器明确写的是 Qwen2.5-VL-3B，而你比赛要用 LingBot-VLA 2.0。因此不能直接拿它的 train.sh 当作比赛训练完成路径。适配器说明
+现在最短路径是：
+1. 先运行 NEXT_STEP_ROCM_v3.ipynb，拿到 LingBot 内核通过结果。
+2. 通过后，建立单卡 AMD 的 LingBot-VLA 2.0 训练环境。
+3. 先用 adjust_bottle 的 50 条 clean 数据完成一次训练、checkpoint 和仿真推理。
+4. 跑通后再扩展到 50 个 clean 任务和正式 10,000 次评测。
+5. 按比赛提交要求生成最终 Zip。
